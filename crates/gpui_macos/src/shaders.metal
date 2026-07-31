@@ -410,19 +410,15 @@ struct BlurFragmentInput {
 constexpr sampler blur_sampler(coord::normalized, filter::linear,
                                address::clamp_to_edge);
 
-float2 blur_position(float2 position, BlurPass blur) {
-  float2 target_origin = float2(blur.target_bounds.origin.x, blur.target_bounds.origin.y);
-  float2 target_size = max(
-      float2(blur.target_bounds.size.width, blur.target_bounds.size.height),
-      float2(1.0, 1.0));
-  float2 sample_origin = float2(blur.sample_bounds.origin.x, blur.sample_bounds.origin.y);
-  float2 sample_size = float2(blur.sample_bounds.size.width, blur.sample_bounds.size.height);
-  return sample_origin + ((position - target_origin) / target_size) * sample_size;
-}
-
+// `position` is an absolute framebuffer coordinate. `blur_source_texture` and
+// `blur_horizontal_texture` are viewport-sized and are written at the same absolute
+// coordinates they're captured from (see `draw_blur_rects`), so sampling uses
+// `position` directly rather than remapping it into some other space. The dilated
+// `sample_bounds` (vs. the tighter `target_bounds` of the composite pass) only exists
+// to give the gaussian kernel real captured pixels to read near the edges of the
+// element being blurred, not to rescale what's sampled.
 float4 blur_along_axis(texture2d<float, access::sample> source_texture,
                        float2 position, BlurPass blur, float2 axis) {
-  float2 sample_position = blur_position(position, blur);
   float sigma = max(blur.blur_radius, 0.001);
   int radius = min(int(ceil(blur.blur_radius * 3.0)), 16);
   float2 texture_size = float2(source_texture.get_width(), source_texture.get_height());
@@ -439,7 +435,7 @@ float4 blur_along_axis(texture2d<float, access::sample> source_texture,
     }
 
     float weight = gaussian(float(offset), sigma);
-    float2 clamped = clamp(sample_position + axis * float(offset), sample_min, sample_max);
+    float2 clamped = clamp(position + axis * float(offset), sample_min, sample_max);
     accum += source_texture.sample(blur_sampler, clamped / texture_size) * weight;
     weight_sum += weight;
   }

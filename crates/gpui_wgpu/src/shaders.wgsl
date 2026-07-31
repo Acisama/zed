@@ -946,6 +946,125 @@ fn fmod(a: f32, b: f32) -> f32 {
     return a - b * trunc(a / b);
 }
 
+// --- blur --- //
+//
+// Backdrop blur is drawn in two passes per blur rect:
+// 1. `fs_blur_horizontal` blurs along x from a copy of the already-rendered
+//    frame (`t_sprite`/`s_sprite`) into an intermediate texture.
+// 2. `fs_blur_composite` blurs that intermediate texture along y, then tints
+//    and rounds the result before it's blended back onto the frame.
+//
+// This mirrors the two-pass approach in gpui_macos's shaders.metal.
+
+struct BlurPass {
+    target_bounds: Bounds,
+    sample_bounds: Bounds,
+    clip_bounds: Bounds,
+    corner_radii: Corners,
+    tint: Hsla,
+    blur_radius: f32,
+    saturation: f32,
+}
+@group(1) @binding(0) var<storage, read> b_blur_passes: array<BlurPass>;
+
+struct BlurVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) blur_id: u32,
+    @location(3) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_blur(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> BlurVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let blur = b_blur_passes[instance_id];
+
+    var out = BlurVarying();
+    out.position = to_device_position(unit_vertex, blur.target_bounds);
+    out.blur_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, blur.target_bounds, blur.clip_bounds);
+    return out;
+}
+
+// `position` is an absolute framebuffer coordinate. Both `blur_source_texture` and
+// `blur_horizontal_texture` are viewport-sized and were written at the same absolute
+// coordinates they're captured from (see `draw_blur_rects`), so sampling uses
+// `position` directly rather than remapping it into some other space. The dilated
+// `sample_bounds` (vs. the tighter `target_bounds` of the composite pass) only exists
+// to give the gaussian kernel real captured pixels to read near the edges of the
+// element being blurred, not to rescale what's sampled.
+fn blur_along_axis(source_texture_size: vec2<f32>, position: vec2<f32>, blur: BlurPass, axis: vec2<f32>) -> vec4<f32> {
+    let sigma = max(blur.blur_radius, 0.001);
+    let radius = min(i32(ceil(blur.blur_radius * 3.0)), 16);
+    let sample_min = blur.sample_bounds.origin;
+    let sample_max = sample_min + max(blur.sample_bounds.size - vec2<f32>(1.0), vec2<f32>(0.0));
+
+    var accum = vec4<f32>(0.0);
+    var weight_sum = 0.0;
+    for (var offset = -16; offset <= 16; offset += 1) {
+        if (abs(offset) > radius) {
+            continue;
+        }
+
+        let weight = gaussian(f32(offset), sigma);
+        let clamped = clamp(position + axis * f32(offset), sample_min, sample_max);
+        accum += textureSampleLevel(t_sprite, s_sprite, clamped / source_texture_size, 0.0) * weight;
+        weight_sum += weight;
+    }
+
+    if (weight_sum == 0.0) {
+        return vec4<f32>(0.0);
+    }
+
+    return accum / weight_sum;
+}
+
+fn composite_blur(blurred: vec4<f32>, blur: BlurPass) -> vec4<f32> {
+    let grayscale = vec3<f32>(dot(blurred.rgb, GRAYSCALE_FACTORS));
+    let tint = hsla_to_rgba(blur.tint);
+    let saturated = mix(grayscale, blurred.rgb, blur.saturation);
+    let alpha = tint.a + blurred.a * (1.0 - tint.a);
+    if (alpha <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+
+    let color = (tint.rgb * tint.a + saturated * blurred.a * (1.0 - tint.a)) / alpha;
+    return vec4<f32>(color, alpha);
+}
+
+@fragment
+fn fs_blur_horizontal(input: BlurVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let blur = b_blur_passes[input.blur_id];
+    let texture_size = vec2<f32>(textureDimensions(t_sprite, 0));
+    return blur_along_axis(texture_size, input.position.xy, blur, vec2<f32>(1.0, 0.0));
+}
+
+@fragment
+fn fs_blur_composite(input: BlurVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let blur = b_blur_passes[input.blur_id];
+    let texture_size = vec2<f32>(textureDimensions(t_sprite, 0));
+    let blurred = blur_along_axis(texture_size, input.position.xy, blur, vec2<f32>(0.0, 1.0));
+    var color = composite_blur(blurred, blur);
+
+    let unrounded = blur.corner_radii.top_left == 0.0 &&
+        blur.corner_radii.bottom_left == 0.0 &&
+        blur.corner_radii.top_right == 0.0 &&
+        blur.corner_radii.bottom_right == 0.0;
+    if (!unrounded) {
+        let distance = quad_sdf(input.position.xy, blur.target_bounds, blur.corner_radii);
+        color = color * vec4<f32>(1.0, 1.0, 1.0, saturate(0.5 - distance));
+    }
+
+    return blend_color(color, 1.0);
+}
+
 // --- shadows --- //
 
 struct Shadow {

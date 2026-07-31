@@ -1,9 +1,9 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, BlurRect, Bounds, Corners, DevicePixels, GpuSpecs, Hsla,
+    MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
+    Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -46,6 +46,98 @@ struct SurfaceParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct PodCorners {
+    top_left: f32,
+    top_right: f32,
+    bottom_right: f32,
+    bottom_left: f32,
+}
+
+impl From<Corners<ScaledPixels>> for PodCorners {
+    fn from(corners: Corners<ScaledPixels>) -> Self {
+        Self {
+            top_left: corners.top_left.0,
+            top_right: corners.top_right.0,
+            bottom_right: corners.bottom_right.0,
+            bottom_left: corners.bottom_left.0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PodHsla {
+    h: f32,
+    s: f32,
+    l: f32,
+    a: f32,
+}
+
+impl From<Hsla> for PodHsla {
+    fn from(hsla: Hsla) -> Self {
+        Self {
+            h: hsla.h,
+            s: hsla.s,
+            l: hsla.l,
+            a: hsla.a,
+        }
+    }
+}
+
+/// Matches the `BlurPass` struct in `shaders.wgsl`, which mirrors the Metal
+/// renderer's `BlurPass` (see `gpui_macos/src/metal_renderer.rs`). One of
+/// these is uploaded per blur pass: a horizontal pass sampling the captured
+/// backdrop, then a composite pass sampling the horizontally-blurred result.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PodBlurPass {
+    target_bounds: PodBounds,
+    sample_bounds: PodBounds,
+    clip_bounds: PodBounds,
+    corner_radii: PodCorners,
+    tint: PodHsla,
+    blur_radius: f32,
+    saturation: f32,
+}
+
+impl PodBlurPass {
+    fn horizontal(capture_bounds: Bounds<ScaledPixels>, blur_radius: ScaledPixels) -> Self {
+        Self {
+            target_bounds: capture_bounds.into(),
+            sample_bounds: capture_bounds.into(),
+            clip_bounds: capture_bounds.into(),
+            corner_radii: PodCorners {
+                top_left: 0.0,
+                top_right: 0.0,
+                bottom_right: 0.0,
+                bottom_left: 0.0,
+            },
+            tint: PodHsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.0,
+                a: 0.0,
+            },
+            blur_radius: blur_radius.0,
+            saturation: 1.0,
+        }
+    }
+
+    fn composite(blur_rect: &BlurRect, capture_bounds: Bounds<ScaledPixels>) -> Self {
+        Self {
+            target_bounds: blur_rect.bounds.into(),
+            sample_bounds: capture_bounds.into(),
+            clip_bounds: blur_rect.content_mask.bounds.into(),
+            corner_radii: blur_rect.corner_radii.into(),
+            tint: blur_rect.tint.into(),
+            blur_radius: blur_rect.blur_radius.0,
+            saturation: blur_rect.saturation,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct GammaParams {
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
@@ -84,6 +176,8 @@ pub struct WgpuSurfaceConfig {
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
+    blur_horizontal: wgpu::RenderPipeline,
+    blur_composite: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
@@ -120,6 +214,15 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    /// Holds a copy of the region of the frame that a blur rect is captured from,
+    /// since the frame's own texture can't be sampled from while it's still being
+    /// rendered into.
+    blur_source_texture: Option<wgpu::Texture>,
+    blur_source_view: Option<wgpu::TextureView>,
+    /// Holds the result of the horizontal blur pass, which the composite pass then
+    /// blurs along the other axis and blends back onto the frame.
+    blur_horizontal_texture: Option<wgpu::Texture>,
+    blur_horizontal_view: Option<wgpu::TextureView>,
 }
 
 impl WgpuResources {
@@ -128,6 +231,10 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.blur_source_texture = None;
+        self.blur_source_view = None;
+        self.blur_horizontal_texture = None;
+        self.blur_horizontal_view = None;
     }
 }
 
@@ -158,6 +265,10 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    /// Whether the surface supports `COPY_SRC`, which backdrop blur needs in order to
+    /// capture the already-rendered frame before drawing over it. When unsupported,
+    /// blur rects are skipped rather than panicking on an invalid texture copy.
+    blur_supported: bool,
 }
 
 impl WgpuRenderer {
@@ -330,8 +441,23 @@ impl WgpuRenderer {
             );
         }
 
+        // Backdrop blur needs to copy the already-rendered frame into a scratch
+        // texture before blurring it, since a texture can't be sampled from while
+        // it's still bound as the render target being drawn into.
+        let blur_supported = surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+        if !blur_supported {
+            warn!(
+                "Surface for adapter {:?} does not support COPY_SRC; backdrop_blur will not be rendered.",
+                context.adapter.get_info().name
+            );
+        }
+        let mut surface_usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        if blur_supported {
+            surface_usage |= wgpu::TextureUsages::COPY_SRC;
+        }
+
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: surface_usage,
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
@@ -463,6 +589,10 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            blur_source_texture: None,
+            blur_source_view: None,
+            blur_horizontal_texture: None,
+            blur_horizontal_view: None,
         };
 
         Ok(Self {
@@ -488,6 +618,7 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            blur_supported,
         })
     }
 
@@ -751,6 +882,39 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        // The horizontal blur pass writes into its own offscreen texture (not the
+        // swapchain), so it always uses plain (non-premultiplied) alpha blending,
+        // matching the fixed blend state gpui_macos's Metal renderer uses for the
+        // same pass, rather than `blend_mode` (which is picked for the swapchain's
+        // alpha compositing mode).
+        let blur_horizontal = create_pipeline(
+            "blur_horizontal",
+            "vs_blur",
+            "fs_blur_horizontal",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
+        let blur_composite = create_pipeline(
+            "blur_composite",
+            "vs_blur",
+            "fs_blur_composite",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
         let path_rasterization = create_pipeline(
             "path_rasterization",
             "vs_path_rasterization",
@@ -880,6 +1044,8 @@ impl WgpuRenderer {
         WgpuPipelines {
             quads,
             shadows,
+            blur_horizontal,
+            blur_composite,
             path_rasterization,
             paths,
             underlines,
@@ -908,6 +1074,30 @@ impl WgpuRenderer {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
+    fn create_blur_source(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("blur_source"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -981,6 +1171,12 @@ impl WgpuRenderer {
             if let Some(ref texture) = resources.path_msaa_texture {
                 texture.destroy();
             }
+            if let Some(ref texture) = resources.blur_source_texture {
+                texture.destroy();
+            }
+            if let Some(ref texture) = resources.blur_horizontal_texture {
+                texture.destroy();
+            }
 
             resources
                 .surface
@@ -1002,6 +1198,7 @@ impl WgpuRenderer {
         let width = self.surface_config.width;
         let height = self.surface_config.height;
         let path_sample_count = self.rendering_params.path_sample_count;
+        let blur_supported = self.blur_supported;
         let resources = self.resources_mut();
 
         let (t, v) = Self::create_path_intermediate(&resources.device, format, width, height);
@@ -1019,6 +1216,18 @@ impl WgpuRenderer {
         .unwrap_or((None, None));
         resources.path_msaa_texture = path_msaa_texture;
         resources.path_msaa_view = path_msaa_view;
+
+        if blur_supported {
+            let (blur_source_texture, blur_source_view) =
+                Self::create_blur_source(&resources.device, format, width, height);
+            resources.blur_source_texture = Some(blur_source_texture);
+            resources.blur_source_view = Some(blur_source_view);
+
+            let (blur_horizontal_texture, blur_horizontal_view) =
+                Self::create_path_intermediate(&resources.device, format, width, height);
+            resources.blur_horizontal_texture = Some(blur_horizontal_texture);
+            resources.blur_horizontal_view = Some(blur_horizontal_view);
+        }
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
@@ -1054,7 +1263,6 @@ impl WgpuRenderer {
         }
     }
 
-    #[allow(dead_code)]
     pub fn viewport_size(&self) -> Size<DevicePixels> {
         Size {
             width: DevicePixels(self.surface_config.width as i32),
@@ -1231,7 +1439,39 @@ impl WgpuRenderer {
 
                 for batch in scene.batches() {
                     let ok = match batch {
-                        PrimitiveBatch::BlurRects(_) => true,
+                        PrimitiveBatch::BlurRects(range) => {
+                            let blur_rects = &scene.blur_rects[range];
+                            if blur_rects.is_empty() || !self.blur_supported {
+                                true
+                            } else {
+                                drop(pass);
+
+                                let did_draw = self.draw_blur_rects(
+                                    &mut encoder,
+                                    blur_rects,
+                                    &frame.texture,
+                                    &frame_view,
+                                    &mut instance_offset,
+                                );
+
+                                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("main_pass_continued"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: &frame_view,
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Load,
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                        depth_slice: None,
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    ..Default::default()
+                                });
+
+                                did_draw
+                            }
+                        }
                         PrimitiveBatch::Quads(range) => {
                             self.draw_quads(&scene.quads[range], &mut instance_offset, &mut pass)
                         }
@@ -1644,6 +1884,125 @@ impl WgpuRenderer {
             pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
             pass.set_bind_group(1, &data_bind_group, &[]);
             pass.draw(0..vertices.len() as u32, 0..1);
+        }
+
+        true
+    }
+
+    /// Draws each blur rect in two passes: a blit of the already-rendered frame into
+    /// `blur_source_texture` (a texture can't be sampled from while it's still the
+    /// active render target), a horizontal blur of that into `blur_horizontal_texture`,
+    /// then a vertical blur + tint + rounding composited back onto the frame. Mirrors
+    /// `MetalRenderer::draw_blur_rects` in gpui_macos/src/metal_renderer.rs.
+    fn draw_blur_rects(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        blur_rects: &[BlurRect],
+        frame_texture: &wgpu::Texture,
+        frame_view: &wgpu::TextureView,
+        instance_offset: &mut u64,
+    ) -> bool {
+        let viewport_size = self.viewport_size();
+
+        for blur_rect in blur_rects {
+            let capture_bounds = blur_rect.capture_bounds(viewport_size);
+            if capture_bounds.is_empty() {
+                continue;
+            }
+
+            let origin = wgpu::Origin3d {
+                x: capture_bounds.origin.x.0.max(0.0) as u32,
+                y: capture_bounds.origin.y.0.max(0.0) as u32,
+                z: 0,
+            };
+            let extent = wgpu::Extent3d {
+                width: capture_bounds.size.width.0 as u32,
+                height: capture_bounds.size.height.0 as u32,
+                depth_or_array_layers: 1,
+            };
+
+            let resources = self.resources();
+            let (Some(blur_source_texture), Some(blur_source_view), Some(blur_horizontal_view)) = (
+                resources.blur_source_texture.as_ref(),
+                resources.blur_source_view.as_ref(),
+                resources.blur_horizontal_view.as_ref(),
+            ) else {
+                return true;
+            };
+
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: frame_texture,
+                    mip_level: 0,
+                    origin,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: blur_source_texture,
+                    mip_level: 0,
+                    origin,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                extent,
+            );
+
+            let horizontal_data = PodBlurPass::horizontal(capture_bounds, blur_rect.blur_radius);
+            {
+                let mut horizontal_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("blur_horizontal_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: blur_horizontal_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                let ok = self.draw_instances_with_texture(
+                    bytemuck::bytes_of(&horizontal_data),
+                    1,
+                    blur_source_view,
+                    &resources.pipelines.blur_horizontal,
+                    instance_offset,
+                    &mut horizontal_pass,
+                );
+                if !ok {
+                    return false;
+                }
+            }
+
+            let composite_data = PodBlurPass::composite(blur_rect, capture_bounds);
+            {
+                let mut composite_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("blur_composite_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: frame_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                let ok = self.draw_instances_with_texture(
+                    bytemuck::bytes_of(&composite_data),
+                    1,
+                    blur_horizontal_view,
+                    &resources.pipelines.blur_composite,
+                    instance_offset,
+                    &mut composite_pass,
+                );
+                if !ok {
+                    return false;
+                }
+            }
         }
 
         true
