@@ -1,4 +1,9 @@
-use std::{fs, path::Path, sync::Arc};
+use std::{
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
+    path::Path,
+    sync::Arc,
+};
 
 use crate::{
     App, Asset, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
@@ -13,6 +18,7 @@ pub struct Svg {
     transformation: Option<Transformation>,
     path: Option<SharedString>,
     external_path: Option<SharedString>,
+    source: Option<(SharedString, Arc<[u8]>)>,
 }
 
 /// Create a new SVG element.
@@ -23,6 +29,7 @@ pub fn svg() -> Svg {
         transformation: None,
         path: None,
         external_path: None,
+        source: None,
     }
 }
 
@@ -43,6 +50,16 @@ impl Svg {
     /// Note that this won't effect the hitbox or layout of the element, only the rendering.
     pub fn with_transformation(mut self, transformation: Transformation) -> Self {
         self.transformation = Some(transformation);
+        self
+    }
+
+    /// Provide raw SVG bytes and a unique cache-key name directly from memory.
+    pub fn source(mut self, bytes: impl Into<Arc<[u8]>>) -> Self {
+        let bytes = bytes.into();
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        let cache_key = SharedString::from(format!("svg-mem-{}", hasher.finish()));
+        self.source = Some((cache_key.into(), bytes.into()));
         self
     }
 }
@@ -151,6 +168,27 @@ impl Element for Svg {
                             bounds,
                             path.clone(),
                             Some(&bytes),
+                            transformation,
+                            color,
+                            cx,
+                        )
+                        .log_err();
+                } else if let Some(((cache_key, bytes), color)) =
+                    self.source.as_ref().zip(style.text.color)
+                {
+                    let transformation = self
+                        .transformation
+                        .as_ref()
+                        .map(|transformation| {
+                            transformation.into_matrix(bounds.center(), window.scale_factor())
+                        })
+                        .unwrap_or_default();
+
+                    window
+                        .paint_svg(
+                            bounds,
+                            cache_key.clone(),
+                            Some(bytes),
                             transformation,
                             color,
                             cx,
