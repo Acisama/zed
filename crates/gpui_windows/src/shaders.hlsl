@@ -843,6 +843,133 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
 /*
 **
+**              Blur
+**
+** Backdrop blur is drawn in two passes per blur rect: `blur_horizontal_fragment`
+** blurs along x from a copy of the already-rendered frame (`t_sprite`/`s_sprite`)
+** into an intermediate texture, then `blur_composite_fragment` blurs that
+** intermediate texture along y, tints and rounds the result, and blends it back
+** onto the frame. This mirrors the two-pass approach in gpui_macos's shaders.metal.
+**
+*/
+
+struct BlurPass {
+    Bounds target_bounds;
+    Bounds sample_bounds;
+    Bounds clip_bounds;
+    Corners corner_radii;
+    Hsla tint;
+    float blur_radius;
+    float saturation;
+};
+
+StructuredBuffer<BlurPass> blur_passes: register(t1);
+
+struct BlurVertexOutput {
+    nointerpolation uint blur_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct BlurFragmentInput {
+    nointerpolation uint blur_id: TEXCOORD0;
+    float4 position: SV_Position;
+};
+
+BlurVertexOutput blur_vertex_impl(uint vertex_id, uint blur_id) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    BlurPass blur = blur_passes[blur_id];
+
+    BlurVertexOutput output;
+    output.position = to_device_position(unit_vertex, blur.target_bounds);
+    output.blur_id = blur_id;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, blur.target_bounds, blur.clip_bounds);
+    return output;
+}
+
+BlurVertexOutput blur_horizontal_vertex(uint vertex_id: SV_VertexID, uint blur_id: SV_InstanceID) {
+    return blur_vertex_impl(vertex_id, blur_id);
+}
+
+BlurVertexOutput blur_composite_vertex(uint vertex_id: SV_VertexID, uint blur_id: SV_InstanceID) {
+    return blur_vertex_impl(vertex_id, blur_id);
+}
+
+// `position` is an absolute framebuffer coordinate. `blur_source_texture` and
+// `blur_horizontal_texture` are viewport-sized and are written at the same absolute
+// coordinates they're captured from (see `draw_blur_rects`), so sampling uses
+// `position` directly rather than remapping it into some other space. The dilated
+// `sample_bounds` (vs. the tighter `target_bounds` of the composite pass) only exists
+// to give the gaussian kernel real captured pixels to read near the edges of the
+// element being blurred, not to rescale what's sampled.
+float4 blur_along_axis(float2 position, BlurPass blur, float2 axis) {
+    float2 texture_size;
+    t_sprite.GetDimensions(texture_size.x, texture_size.y);
+
+    float sigma = max(blur.blur_radius, 0.001);
+    float radius = ceil(sigma * 3.0);
+    // Only 33 taps are ever sampled per axis. For small radii they land on every
+    // pixel; beyond a radius of 16, taps are spaced `step` pixels apart instead of
+    // adding more of them, trading precision (some banding at very large radii) for
+    // a fixed cost, while still reaching all the way to the edge of the kernel.
+    float step = max(radius / 16.0, 1.0);
+    float2 sample_min = blur.sample_bounds.origin;
+    float2 sample_max = sample_min + max(blur.sample_bounds.size - 1.0, float2(0.0, 0.0));
+
+    float4 accum = float4(0.0, 0.0, 0.0, 0.0);
+    float weight_sum = 0.0;
+    for (int tap = -16; tap <= 16; ++tap) {
+        float offset = float(tap) * step;
+        float weight = gaussian(offset, sigma);
+        float2 clamped = clamp(position + axis * offset, sample_min, sample_max);
+        accum += t_sprite.SampleLevel(s_sprite, clamped / texture_size, 0.0) * weight;
+        weight_sum += weight;
+    }
+
+    if (weight_sum == 0.0) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    return accum / weight_sum;
+}
+
+float4 composite_blur(float4 blurred, BlurPass blur) {
+    float3 grayscale = dot(blurred.rgb, GRAYSCALE_FACTORS);
+    float4 tint = hsla_to_rgba(blur.tint);
+    float3 saturated = lerp(grayscale, blurred.rgb, blur.saturation);
+    float alpha = tint.a + blurred.a * (1.0 - tint.a);
+    if (alpha <= 0.0) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float3 color = (tint.rgb * tint.a + saturated * blurred.a * (1.0 - tint.a)) / alpha;
+    return float4(color, alpha);
+}
+
+float4 blur_horizontal_fragment(BlurFragmentInput input): SV_Target {
+    BlurPass blur = blur_passes[input.blur_id];
+    return blur_along_axis(input.position.xy, blur, float2(1.0, 0.0));
+}
+
+float4 blur_composite_fragment(BlurFragmentInput input): SV_Target {
+    BlurPass blur = blur_passes[input.blur_id];
+    float4 blurred = blur_along_axis(input.position.xy, blur, float2(0.0, 1.0));
+    float4 color = composite_blur(blurred, blur);
+
+    bool unrounded = blur.corner_radii.top_left == 0.0 &&
+        blur.corner_radii.bottom_left == 0.0 &&
+        blur.corner_radii.top_right == 0.0 &&
+        blur.corner_radii.bottom_right == 0.0;
+    if (!unrounded) {
+        float distance = quad_sdf(input.position.xy, blur.target_bounds, blur.corner_radii);
+        color = color * float4(1.0, 1.0, 1.0, saturate(0.5 - distance));
+    }
+
+    return color;
+}
+
+/*
+**
 **              Shadows
 **
 */

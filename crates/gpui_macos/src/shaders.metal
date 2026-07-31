@@ -420,7 +420,12 @@ constexpr sampler blur_sampler(coord::normalized, filter::linear,
 float4 blur_along_axis(texture2d<float, access::sample> source_texture,
                        float2 position, BlurPass blur, float2 axis) {
   float sigma = max(blur.blur_radius, 0.001);
-  int radius = min(int(ceil(blur.blur_radius * 3.0)), 16);
+  float radius = ceil(sigma * 3.0);
+  // Only 33 taps are ever sampled per axis. For small radii they land on every
+  // pixel; beyond a radius of 16, taps are spaced `step` pixels apart instead of
+  // adding more of them, trading precision (some banding at very large radii) for
+  // a fixed cost, while still reaching all the way to the edge of the kernel.
+  float step = max(radius / 16.0, 1.0);
   float2 texture_size = float2(source_texture.get_width(), source_texture.get_height());
   float2 sample_min = float2(blur.sample_bounds.origin.x, blur.sample_bounds.origin.y);
   float2 sample_max = sample_min +
@@ -429,13 +434,10 @@ float4 blur_along_axis(texture2d<float, access::sample> source_texture,
 
   float4 accum = float4(0.0);
   float weight_sum = 0.0;
-  for (int offset = -16; offset <= 16; ++offset) {
-    if (abs(offset) > radius) {
-      continue;
-    }
-
-    float weight = gaussian(float(offset), sigma);
-    float2 clamped = clamp(position + axis * float(offset), sample_min, sample_max);
+  for (int tap = -16; tap <= 16; ++tap) {
+    float offset = float(tap) * step;
+    float weight = gaussian(offset, sigma);
+    float2 clamped = clamp(position + axis * offset, sample_min, sample_max);
     accum += source_texture.sample(blur_sampler, clamped / texture_size) * weight;
     weight_sum += weight;
   }

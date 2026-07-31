@@ -78,6 +78,17 @@ struct DirectXResources {
     path_intermediate_msaa_texture: ID3D11Texture2D,
     path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
 
+    // Holds a copy of the region of the frame that a blur rect is captured from,
+    // since the frame's own texture can't be read from a shader while it's still
+    // bound as the render target being drawn into.
+    blur_source_texture: ID3D11Texture2D,
+    blur_source_srv: Option<ID3D11ShaderResourceView>,
+    // Holds the result of the horizontal blur pass, which the composite pass then
+    // blurs along the other axis and blends back onto the frame.
+    blur_horizontal_texture: ID3D11Texture2D,
+    blur_horizontal_srv: Option<ID3D11ShaderResourceView>,
+    blur_horizontal_view: Option<ID3D11RenderTargetView>,
+
     // Cached viewport
     viewport: D3D11_VIEWPORT,
 }
@@ -85,6 +96,8 @@ struct DirectXResources {
 struct DirectXRenderPipelines {
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
+    blur_horizontal_pipeline: PipelineState<BlurPass>,
+    blur_composite_pipeline: PipelineState<BlurPass>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
     underline_pipeline: PipelineState<Underline>,
@@ -96,6 +109,10 @@ struct DirectXRenderPipelines {
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    /// Unlike `sampler` (which wraps), blur must clamp to edge: it only ever samples
+    /// within the captured backdrop region, and wrapping would read pixels from the
+    /// opposite side of the frame.
+    blur_sampler: Option<ID3D11SamplerState>,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -346,7 +363,7 @@ impl DirectXRenderer {
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
             match batch {
-                PrimitiveBatch::BlurRects(_) => Ok(()),
+                PrimitiveBatch::BlurRects(range) => self.draw_blur_rects(&scene.blur_rects[range]),
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
@@ -524,6 +541,106 @@ impl DirectXRenderer {
             start as u32,
             len as u32,
         )
+    }
+
+    /// Draws each blur rect in two passes: a copy of the already-rendered frame into
+    /// `blur_source_texture` (a texture can't be read from a shader while it's still the
+    /// active render target), a horizontal blur of that into `blur_horizontal_texture`,
+    /// then a vertical blur + tint + rounding composited back onto the frame. Mirrors
+    /// `MetalRenderer::draw_blur_rects` in gpui_macos/src/metal_renderer.rs.
+    fn draw_blur_rects(&mut self, blur_rects: &[BlurRect]) -> Result<()> {
+        if blur_rects.is_empty() {
+            return Ok(());
+        }
+
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let viewport_size = Size {
+            width: DevicePixels(resources.viewport.Width as i32),
+            height: DevicePixels(resources.viewport.Height as i32),
+        };
+        let render_target = resources
+            .render_target
+            .as_ref()
+            .context("missing render target")?;
+        let blur_horizontal_view = resources
+            .blur_horizontal_view
+            .as_ref()
+            .context("missing blur horizontal view")?;
+
+        for blur_rect in blur_rects {
+            let capture_bounds = blur_rect.capture_bounds(viewport_size);
+            if capture_bounds.is_empty() {
+                continue;
+            }
+
+            let src_box = D3D11_BOX {
+                left: capture_bounds.left().0 as u32,
+                top: capture_bounds.top().0 as u32,
+                front: 0,
+                right: capture_bounds.right().0 as u32,
+                bottom: capture_bounds.bottom().0 as u32,
+                back: 1,
+            };
+            unsafe {
+                devices.device_context.CopySubresourceRegion(
+                    &resources.blur_source_texture,
+                    0,
+                    src_box.left,
+                    src_box.top,
+                    0,
+                    render_target,
+                    0,
+                    Some(&src_box),
+                );
+            }
+
+            let horizontal_pass = BlurPass::horizontal(capture_bounds, blur_rect.blur_radius);
+            self.pipelines.blur_horizontal_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &[horizontal_pass],
+            )?;
+            unsafe {
+                devices
+                    .device_context
+                    .ClearRenderTargetView(blur_horizontal_view, &[0.0; 4]);
+                devices
+                    .device_context
+                    .OMSetRenderTargets(Some(slice::from_ref(&resources.blur_horizontal_view)), None);
+            }
+            self.pipelines.blur_horizontal_pipeline.draw_with_texture(
+                &devices.device_context,
+                slice::from_ref(&resources.blur_source_srv),
+                slice::from_ref(&resources.viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.blur_sampler),
+                1,
+            )?;
+
+            let composite_pass = BlurPass::composite(blur_rect, capture_bounds);
+            self.pipelines.blur_composite_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &[composite_pass],
+            )?;
+            unsafe {
+                devices.device_context.OMSetRenderTargets(
+                    Some(slice::from_ref(&resources.render_target_view)),
+                    None,
+                );
+            }
+            self.pipelines.blur_composite_pipeline.draw_with_texture(
+                &devices.device_context,
+                slice::from_ref(&resources.blur_horizontal_srv),
+                slice::from_ref(&resources.viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.blur_sampler),
+                1,
+            )?;
+        }
+
+        Ok(())
     }
 
     fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
@@ -802,26 +919,23 @@ impl DirectXResources {
             )?
         };
 
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &swap_chain, width, height)?;
+        let created = create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
             swap_chain,
-            render_target: Some(render_target),
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            path_intermediate_srv,
-            viewport,
+            render_target: Some(created.render_target),
+            render_target_view: created.render_target_view,
+            path_intermediate_texture: created.path_intermediate_texture,
+            path_intermediate_srv: created.path_intermediate_srv,
+            path_intermediate_msaa_texture: created.path_intermediate_msaa_texture,
+            path_intermediate_msaa_view: created.path_intermediate_msaa_view,
+            blur_source_texture: created.blur_source_texture,
+            blur_source_srv: created.blur_source_srv,
+            blur_horizontal_texture: created.blur_horizontal_texture,
+            blur_horizontal_srv: created.blur_horizontal_srv,
+            blur_horizontal_view: created.blur_horizontal_view,
+            viewport: created.viewport,
         })
     }
 
@@ -832,22 +946,19 @@ impl DirectXResources {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &self.swap_chain, width, height)?;
-        self.render_target = Some(render_target);
-        self.render_target_view = render_target_view;
-        self.path_intermediate_texture = path_intermediate_texture;
-        self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
-        self.path_intermediate_msaa_view = path_intermediate_msaa_view;
-        self.path_intermediate_srv = path_intermediate_srv;
-        self.viewport = viewport;
+        let created = create_resources(devices, &self.swap_chain, width, height)?;
+        self.render_target = Some(created.render_target);
+        self.render_target_view = created.render_target_view;
+        self.path_intermediate_texture = created.path_intermediate_texture;
+        self.path_intermediate_msaa_texture = created.path_intermediate_msaa_texture;
+        self.path_intermediate_msaa_view = created.path_intermediate_msaa_view;
+        self.path_intermediate_srv = created.path_intermediate_srv;
+        self.blur_source_texture = created.blur_source_texture;
+        self.blur_source_srv = created.blur_source_srv;
+        self.blur_horizontal_texture = created.blur_horizontal_texture;
+        self.blur_horizontal_srv = created.blur_horizontal_srv;
+        self.blur_horizontal_view = created.blur_horizontal_view;
+        self.viewport = created.viewport;
         Ok(())
     }
 }
@@ -866,6 +977,20 @@ impl DirectXRenderPipelines {
             "quad_pipeline",
             ShaderModule::Quad,
             64,
+            create_blend_state(device)?,
+        )?;
+        let blur_horizontal_pipeline = PipelineState::new(
+            device,
+            "blur_horizontal_pipeline",
+            ShaderModule::BlurHorizontal,
+            4,
+            create_blend_state(device)?,
+        )?;
+        let blur_composite_pipeline = PipelineState::new(
+            device,
+            "blur_composite_pipeline",
+            ShaderModule::BlurComposite,
+            4,
             create_blend_state(device)?,
         )?;
         let path_rasterization_pipeline = PipelineState::new(
@@ -914,6 +1039,8 @@ impl DirectXRenderPipelines {
         Ok(Self {
             shadow_pipeline,
             quad_pipeline,
+            blur_horizontal_pipeline,
+            blur_composite_pipeline,
             path_rasterization_pipeline,
             path_sprite_pipeline,
             underline_pipeline,
@@ -980,9 +1107,28 @@ impl DirectXGlobalElements {
             output
         };
 
+        let blur_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
+
         Ok(Self {
             global_params_buffer,
             sampler,
+            blur_sampler,
         })
     }
 }
@@ -1191,6 +1337,48 @@ struct PathSprite {
     bounds: Bounds<ScaledPixels>,
 }
 
+/// Matches the `BlurPass` struct in `shaders.hlsl`, which mirrors the Metal
+/// renderer's `BlurPass` (see `gpui_macos/src/metal_renderer.rs`). One of these is
+/// uploaded per blur pass: a horizontal pass sampling the captured backdrop, then a
+/// composite pass sampling the horizontally-blurred result.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct BlurPass {
+    target_bounds: Bounds<ScaledPixels>,
+    sample_bounds: Bounds<ScaledPixels>,
+    clip_bounds: Bounds<ScaledPixels>,
+    corner_radii: Corners<ScaledPixels>,
+    tint: Hsla,
+    blur_radius: ScaledPixels,
+    saturation: f32,
+}
+
+impl BlurPass {
+    fn horizontal(capture_bounds: Bounds<ScaledPixels>, blur_radius: ScaledPixels) -> Self {
+        Self {
+            target_bounds: capture_bounds,
+            sample_bounds: capture_bounds,
+            clip_bounds: capture_bounds,
+            corner_radii: Corners::default(),
+            tint: transparent_black(),
+            blur_radius,
+            saturation: 1.0,
+        }
+    }
+
+    fn composite(blur_rect: &BlurRect, capture_bounds: Bounds<ScaledPixels>) -> Self {
+        Self {
+            target_bounds: blur_rect.bounds,
+            sample_bounds: capture_bounds,
+            clip_bounds: blur_rect.content_mask.bounds,
+            corner_radii: blur_rect.corner_radii,
+            tint: blur_rect.tint,
+            blur_radius: blur_rect.blur_radius,
+            saturation: blur_rect.saturation,
+        }
+    }
+}
+
 impl Drop for DirectXRenderer {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
@@ -1262,36 +1450,128 @@ fn create_swap_chain(
     Ok(swap_chain)
 }
 
+struct CreatedResources {
+    render_target: ID3D11Texture2D,
+    render_target_view: Option<ID3D11RenderTargetView>,
+    path_intermediate_texture: ID3D11Texture2D,
+    path_intermediate_srv: Option<ID3D11ShaderResourceView>,
+    path_intermediate_msaa_texture: ID3D11Texture2D,
+    path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
+    blur_source_texture: ID3D11Texture2D,
+    blur_source_srv: Option<ID3D11ShaderResourceView>,
+    blur_horizontal_texture: ID3D11Texture2D,
+    blur_horizontal_srv: Option<ID3D11ShaderResourceView>,
+    blur_horizontal_view: Option<ID3D11RenderTargetView>,
+    viewport: D3D11_VIEWPORT,
+}
+
 #[inline]
 fn create_resources(
     devices: &DirectXRendererDevices,
     swap_chain: &IDXGISwapChain1,
     width: u32,
     height: u32,
-) -> Result<(
-    ID3D11Texture2D,
-    Option<ID3D11RenderTargetView>,
-    ID3D11Texture2D,
-    Option<ID3D11ShaderResourceView>,
-    ID3D11Texture2D,
-    Option<ID3D11RenderTargetView>,
-    D3D11_VIEWPORT,
-)> {
+) -> Result<CreatedResources> {
     let (render_target, render_target_view) =
         create_render_target_and_its_view(swap_chain, &devices.device)?;
     let (path_intermediate_texture, path_intermediate_srv) =
         create_path_intermediate_texture(&devices.device, width, height)?;
     let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
         create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
+    let (blur_source_texture, blur_source_srv) =
+        create_blur_source_texture(&devices.device, width, height)?;
+    let (blur_horizontal_texture, blur_horizontal_srv, blur_horizontal_view) =
+        create_blur_horizontal_texture(&devices.device, width, height)?;
     let viewport = set_viewport(&devices.device_context, width as f32, height as f32);
-    Ok((
+    Ok(CreatedResources {
         render_target,
         render_target_view,
         path_intermediate_texture,
         path_intermediate_srv,
         path_intermediate_msaa_texture,
         path_intermediate_msaa_view,
+        blur_source_texture,
+        blur_source_srv,
+        blur_horizontal_texture,
+        blur_horizontal_srv,
+        blur_horizontal_view,
         viewport,
+    })
+}
+
+#[inline]
+fn create_blur_source_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<(ID3D11Texture2D, Option<ID3D11ShaderResourceView>)> {
+    let texture = unsafe {
+        let mut output = None;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: RENDER_TARGET_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        output.unwrap()
+    };
+
+    let mut shader_resource_view = None;
+    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))? };
+
+    Ok((texture, Some(shader_resource_view.unwrap())))
+}
+
+#[inline]
+fn create_blur_horizontal_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<(
+    ID3D11Texture2D,
+    Option<ID3D11ShaderResourceView>,
+    Option<ID3D11RenderTargetView>,
+)> {
+    let texture = unsafe {
+        let mut output = None;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: RENDER_TARGET_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        output.unwrap()
+    };
+
+    let mut shader_resource_view = None;
+    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))? };
+    let mut render_target_view = None;
+    unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut render_target_view))? };
+
+    Ok((
+        texture,
+        Some(shader_resource_view.unwrap()),
+        Some(render_target_view.unwrap()),
     ))
 }
 
@@ -1626,6 +1906,8 @@ pub(crate) mod shader_resources {
     pub(crate) enum ShaderModule {
         Quad,
         Shadow,
+        BlurHorizontal,
+        BlurComposite,
         Underline,
         PathRasterization,
         PathSprite,
@@ -1681,6 +1963,14 @@ pub(crate) mod shader_resources {
                 ShaderModule::Shadow => match target {
                     ShaderTarget::Vertex => SHADOW_VERTEX_BYTES,
                     ShaderTarget::Fragment => SHADOW_FRAGMENT_BYTES,
+                },
+                ShaderModule::BlurHorizontal => match target {
+                    ShaderTarget::Vertex => BLUR_HORIZONTAL_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BLUR_HORIZONTAL_FRAGMENT_BYTES,
+                },
+                ShaderModule::BlurComposite => match target {
+                    ShaderTarget::Vertex => BLUR_COMPOSITE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BLUR_COMPOSITE_FRAGMENT_BYTES,
                 },
                 ShaderModule::Underline => match target {
                     ShaderTarget::Vertex => UNDERLINE_VERTEX_BYTES,
@@ -1790,6 +2080,8 @@ pub(crate) mod shader_resources {
             match self {
                 ShaderModule::Quad => "quad",
                 ShaderModule::Shadow => "shadow",
+                ShaderModule::BlurHorizontal => "blur_horizontal",
+                ShaderModule::BlurComposite => "blur_composite",
                 ShaderModule::Underline => "underline",
                 ShaderModule::PathRasterization => "path_rasterization",
                 ShaderModule::PathSprite => "path_sprite",
