@@ -59,7 +59,7 @@ impl Svg {
         let mut hasher = DefaultHasher::new();
         bytes.hash(&mut hasher);
         let cache_key = SharedString::from(format!("svg-mem-{}", hasher.finish()));
-        self.source = Some((cache_key.into(), bytes.into()));
+        self.source = Some((cache_key, bytes));
         self
     }
 }
@@ -133,7 +133,8 @@ impl Element for Svg {
             window,
             cx,
             |style, window, cx| {
-                if let Some((path, color)) = self.path.as_ref().zip(style.text.color) {
+                let color = style.text.color.or_else(|| Some(window.text_style().color));
+                if let Some((path, color)) = self.path.as_ref().zip(color) {
                     let transformation = self
                         .transformation
                         .as_ref()
@@ -145,9 +146,7 @@ impl Element for Svg {
                     window
                         .paint_svg(bounds, path.clone(), None, transformation, color, cx)
                         .log_err();
-                } else if let Some((path, color)) =
-                    self.external_path.as_ref().zip(style.text.color)
-                {
+                } else if let Some((path, color)) = self.external_path.as_ref().zip(color) {
                     let Some(bytes) = window
                         .use_asset::<SvgAsset>(path, cx)
                         .and_then(|asset| asset.log_err())
@@ -173,9 +172,7 @@ impl Element for Svg {
                             cx,
                         )
                         .log_err();
-                } else if let Some(((cache_key, bytes), color)) =
-                    self.source.as_ref().zip(style.text.color)
-                {
+                } else if let Some(((cache_key, bytes), color)) = self.source.as_ref().zip(color) {
                     let transformation = self
                         .transformation
                         .as_ref()
