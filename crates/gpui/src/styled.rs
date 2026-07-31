@@ -33,6 +33,12 @@ pub trait Styled: Sized {
     gpui_macros::border_style_methods!();
     gpui_macros::box_shadow_style_methods!();
 
+    /// Applies a backdrop blur to content rendered behind this element.
+    fn backdrop_blur(mut self, radius: impl Into<AbsoluteLength>) -> Self {
+        self.style().backdrop_blur = Some(radius.into());
+        self
+    }
+
     /// Sets the display type of the element to `block`.
     /// [Docs](https://tailwindcss.com/docs/display)
     fn block(mut self) -> Self {

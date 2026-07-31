@@ -1231,6 +1231,7 @@ impl WgpuRenderer {
 
                 for batch in scene.batches() {
                     let ok = match batch {
+                        PrimitiveBatch::BlurRects(_) => true,
                         PrimitiveBatch::Quads(range) => {
                             self.draw_quads(&scene.quads[range], &mut instance_offset, &mut pass)
                         }

@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges,
+    Hsla, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -43,6 +43,7 @@ pub struct Scene {
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
     pub shadows: Vec<Shadow>,
+    pub blur_rects: Vec<BlurRect>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
     pub underlines: Vec<Underline>,
@@ -60,6 +61,7 @@ impl Scene {
         self.layer_stack.clear();
         self.paths.clear();
         self.shadows.clear();
+        self.blur_rects.clear();
         self.quads.clear();
         self.underlines.clear();
         self.monochrome_sprites.clear();
@@ -103,6 +105,10 @@ impl Scene {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
                 self.shadows.push(*shadow);
+            }
+            Primitive::BlurRect(blur_rect) => {
+                blur_rect.order = order;
+                self.blur_rects.push(*blur_rect);
             }
             Primitive::Quad(quad) => {
                 quad.order = order;
@@ -150,6 +156,7 @@ impl Scene {
 
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
+        self.blur_rects.sort_by_key(|blur_rect| blur_rect.order);
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
@@ -173,6 +180,8 @@ impl Scene {
         BatchIterator {
             shadows_start: 0,
             shadows_iter: self.shadows.iter().peekable(),
+            blur_rects_start: 0,
+            blur_rects_iter: self.blur_rects.iter().peekable(),
             quads_start: 0,
             quads_iter: self.quads.iter().peekable(),
             paths_start: 0,
@@ -200,6 +209,7 @@ impl Scene {
     allow(dead_code)
 )]
 pub(crate) enum PrimitiveKind {
+    BlurRect,
     Shadow,
     #[default]
     Quad,
@@ -221,6 +231,7 @@ pub(crate) enum PaintOperation {
 #[expect(missing_docs)]
 pub enum Primitive {
     Shadow(Shadow),
+    BlurRect(BlurRect),
     Quad(Quad),
     Path(Path<ScaledPixels>),
     Underline(Underline),
@@ -235,6 +246,7 @@ impl Primitive {
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
+            Primitive::BlurRect(blur_rect) => &blur_rect.bounds,
             Primitive::Quad(quad) => &quad.bounds,
             Primitive::Path(path) => &path.bounds,
             Primitive::Underline(underline) => &underline.bounds,
@@ -248,6 +260,7 @@ impl Primitive {
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.content_mask,
+            Primitive::BlurRect(blur_rect) => &blur_rect.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
             Primitive::Path(path) => &path.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
@@ -269,6 +282,8 @@ impl Primitive {
 struct BatchIterator<'a> {
     shadows_start: usize,
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
+    blur_rects_start: usize,
+    blur_rects_iter: Peekable<slice::Iter<'a, BlurRect>>,
     quads_start: usize,
     quads_iter: Peekable<slice::Iter<'a, Quad>>,
     paths_start: usize,
@@ -290,6 +305,10 @@ impl<'a> Iterator for BatchIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
+            (
+                self.blur_rects_iter.peek().map(|b| b.order),
+                PrimitiveKind::BlurRect,
+            ),
             (
                 self.shadows_iter.peek().map(|s| s.order),
                 PrimitiveKind::Shadow,
@@ -328,6 +347,20 @@ impl<'a> Iterator for BatchIterator<'a> {
         };
 
         match batch_kind {
+            PrimitiveKind::BlurRect => {
+                let blur_rects_start = self.blur_rects_start;
+                let mut blur_rects_end = blur_rects_start + 1;
+                self.blur_rects_iter.next();
+                while self
+                    .blur_rects_iter
+                    .next_if(|blur_rect| (blur_rect.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    blur_rects_end += 1;
+                }
+                self.blur_rects_start = blur_rects_end;
+                Some(PrimitiveBatch::BlurRects(blur_rects_start..blur_rects_end))
+            }
             PrimitiveKind::Shadow => {
                 let shadows_start = self.shadows_start;
                 let mut shadows_end = shadows_start + 1;
@@ -475,6 +508,7 @@ impl<'a> Iterator for BatchIterator<'a> {
 )]
 #[allow(missing_docs)]
 pub enum PrimitiveBatch {
+    BlurRects(Range<usize>),
     Shadows(Range<usize>),
     Quads(Range<usize>),
     Paths(Range<usize>),
@@ -499,6 +533,7 @@ impl PrimitiveBatch {
     #[expect(missing_docs)]
     pub fn label(&self) -> String {
         match self {
+            Self::BlurRects(range) => format!("blur rects ({})", range.len()),
             Self::Shadows(range) => format!("shadows ({})", range.len()),
             Self::Quads(range) => format!("quads ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),
@@ -588,6 +623,45 @@ pub struct Shadow {
 impl From<Shadow> for Primitive {
     fn from(shadow: Shadow) -> Self {
         Primitive::Shadow(shadow)
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct BlurRect {
+    pub order: DrawOrder,
+    pub blur_radius: ScaledPixels,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub tint: Hsla,
+    pub saturation: f32,
+}
+
+impl From<BlurRect> for Primitive {
+    fn from(blur_rect: BlurRect) -> Self {
+        Primitive::BlurRect(blur_rect)
+    }
+}
+
+impl BlurRect {
+    #[expect(missing_docs)]
+    pub fn capture_bounds(&self, viewport_size: Size<DevicePixels>) -> Bounds<ScaledPixels> {
+        let margin = ScaledPixels((self.blur_radius.0 * 3.0).ceil());
+        let viewport_bounds = Bounds {
+            origin: point(ScaledPixels::default(), ScaledPixels::default()),
+            size: Size {
+                width: ScaledPixels::from(viewport_size.width),
+                height: ScaledPixels::from(viewport_size.height),
+            },
+        };
+
+        self.bounds
+            .dilate(margin)
+            .intersect(&viewport_bounds)
+            .map_origin(|origin| origin.floor())
+            .map_size(|size| size.ceil())
     }
 }
 

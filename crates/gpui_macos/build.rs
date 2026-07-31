@@ -50,7 +50,9 @@ mod macos_build {
             "PathRasterizationVertex".into(),
             "ShadowInputIndex".into(),
             "Shadow".into(),
+            "BlurRect".into(),
             "QuadInputIndex".into(),
+            "BlurInputIndex".into(),
             "Underline".into(),
             "UnderlineInputIndex".into(),
             "Quad".into(),
@@ -61,6 +63,7 @@ mod macos_build {
             "PathSprite".into(),
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
+            "BlurPass".into(),
             "TransformationMatrix".into(),
         ]);
         config.no_includes = true;

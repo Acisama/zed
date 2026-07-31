@@ -2,7 +2,8 @@
 use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BlurRect, BorderStyle, Bounds,
+    BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
@@ -3965,6 +3966,26 @@ impl Window {
                 pad: 0,
             });
         }
+    }
+
+    /// Paint a backdrop blur at the current z-index.
+    pub fn paint_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        self.next_frame.scene.insert_primitive(BlurRect {
+            order: 0,
+            blur_radius: blur_radius.scale(self.scale_factor()),
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(self.scale_factor()),
+            tint: transparent_black(),
+            saturation: 1.0,
+        });
     }
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
