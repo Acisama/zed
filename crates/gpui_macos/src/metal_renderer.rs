@@ -7,9 +7,9 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    AtlasTextureId, Background, BlurRect, Bounds, ContentMask, DevicePixels, MonochromeSprite,
+    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
+    Size, Surface, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -120,6 +120,8 @@ pub(crate) struct MetalRenderer {
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
     shadows_pipeline_state: metal::RenderPipelineState,
+    blur_horizontal_pipeline_state: metal::RenderPipelineState,
+    blur_composite_pipeline_state: metal::RenderPipelineState,
     quads_pipeline_state: metal::RenderPipelineState,
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
@@ -130,6 +132,8 @@ pub(crate) struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    blur_source_texture: Option<metal::Texture>,
+    blur_horizontal_texture: Option<metal::Texture>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -282,6 +286,22 @@ impl MetalRenderer {
             "shadow_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let blur_horizontal_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "blur_horizontal",
+            "blur_vertex",
+            "blur_horizontal_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let blur_composite_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "blur_composite",
+            "blur_vertex",
+            "blur_composite_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let quads_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -339,6 +359,8 @@ impl MetalRenderer {
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
             shadows_pipeline_state,
+            blur_horizontal_pipeline_state,
+            blur_composite_pipeline_state,
             quads_pipeline_state,
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
@@ -348,6 +370,8 @@ impl MetalRenderer {
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
+            blur_source_texture: None,
+            blur_horizontal_texture: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -399,6 +423,8 @@ impl MetalRenderer {
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
         if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.blur_source_texture = None;
+            self.blur_horizontal_texture = None;
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
             return;
@@ -430,6 +456,37 @@ impl MetalRenderer {
         } else {
             self.path_intermediate_msaa_texture = None;
         }
+    }
+
+    fn ensure_blur_textures(&mut self, size: Size<DevicePixels>) -> bool {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.blur_source_texture = None;
+            self.blur_horizontal_texture = None;
+            return false;
+        }
+
+        let texture_needs_resize = |texture: Option<&metal::Texture>| {
+            texture.is_none_or(|texture| {
+                texture.width() != size.width.0 as u64 || texture.height() != size.height.0 as u64
+            })
+        };
+
+        if texture_needs_resize(self.blur_source_texture.as_ref())
+            || texture_needs_resize(self.blur_horizontal_texture.as_ref())
+        {
+            let texture_descriptor = metal::TextureDescriptor::new();
+            texture_descriptor.set_width(size.width.0 as u64);
+            texture_descriptor.set_height(size.height.0 as u64);
+            texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+            texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            texture_descriptor
+                .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+
+            self.blur_source_texture = Some(self.device.new_texture(&texture_descriptor));
+            self.blur_horizontal_texture = Some(self.device.new_texture(&texture_descriptor));
+        }
+
+        true
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -856,6 +913,27 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::BlurRects(range) => {
+                    command_encoder.end_encoding();
+
+                    let did_draw = self.draw_blur_rects(
+                        &scene.blur_rects[range],
+                        viewport_size,
+                        command_buffer,
+                        texture,
+                    );
+
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        texture,
+                        viewport_size,
+                        |color_attachment| {
+                            color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                        },
+                    );
+
+                    did_draw
+                }
                 PrimitiveBatch::Quads(range) => self.draw_quads(
                     &scene.quads[range],
                     instance_buffer,
@@ -933,9 +1011,10 @@ impl MetalRenderer {
             if !ok {
                 command_encoder.end_encoding();
                 anyhow::bail!(
-                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                    "scene too large: {} paths, {} shadows, {} blur rects, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
                     scene.paths.len(),
                     scene.shadows.len(),
+                    scene.blur_rects.len(),
                     scene.quads.len(),
                     scene.underlines.len(),
                     scene.monochrome_sprites.len(),
@@ -1104,6 +1183,140 @@ impl MetalRenderer {
             shadows.len() as u64,
         );
         *instance_offset = next_offset;
+        true
+    }
+
+    fn draw_blur_rects(
+        &mut self,
+        blur_rects: &[BlurRect],
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+        target_texture: &metal::TextureRef,
+    ) -> bool {
+        if blur_rects.is_empty() {
+            return true;
+        }
+
+        if !self.ensure_blur_textures(viewport_size) {
+            return false;
+        }
+
+        let Some(blur_source_texture) = self.blur_source_texture.as_ref() else {
+            return false;
+        };
+        let Some(blur_horizontal_texture) = self.blur_horizontal_texture.as_ref() else {
+            return false;
+        };
+
+        for blur_rect in blur_rects {
+            let capture_bounds = blur_rect.capture_bounds(viewport_size);
+            if capture_bounds.is_empty() {
+                continue;
+            }
+
+            let horizontal_pass = BlurPass::horizontal(*blur_rect, capture_bounds);
+            let composite_pass = BlurPass::composite(*blur_rect, capture_bounds);
+
+            let blit_encoder = command_buffer.new_blit_command_encoder();
+            blit_encoder.copy_from_texture(
+                target_texture,
+                0,
+                0,
+                metal::MTLOrigin {
+                    x: capture_bounds.origin.x.0 as u64,
+                    y: capture_bounds.origin.y.0 as u64,
+                    z: 0,
+                },
+                metal::MTLSize {
+                    width: capture_bounds.size.width.0 as u64,
+                    height: capture_bounds.size.height.0 as u64,
+                    depth: 1,
+                },
+                blur_source_texture,
+                0,
+                0,
+                metal::MTLOrigin {
+                    x: capture_bounds.origin.x.0 as u64,
+                    y: capture_bounds.origin.y.0 as u64,
+                    z: 0,
+                },
+            );
+            blit_encoder.end_encoding();
+
+            let horizontal_encoder = new_command_encoder_for_texture(
+                command_buffer,
+                blur_horizontal_texture,
+                viewport_size,
+                |color_attachment| {
+                    color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+                    color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
+                },
+            );
+            horizontal_encoder.set_render_pipeline_state(&self.blur_horizontal_pipeline_state);
+            horizontal_encoder.set_vertex_buffer(
+                BlurInputIndex::Vertices as u64,
+                Some(&self.unit_vertices),
+                0,
+            );
+            horizontal_encoder.set_vertex_bytes(
+                BlurInputIndex::BlurPass as u64,
+                mem::size_of::<BlurPass>() as u64,
+                &horizontal_pass as *const BlurPass as *const _,
+            );
+            horizontal_encoder.set_vertex_bytes(
+                BlurInputIndex::ViewportSize as u64,
+                mem::size_of_val(&viewport_size) as u64,
+                &viewport_size as *const Size<DevicePixels> as *const _,
+            );
+            horizontal_encoder.set_fragment_bytes(
+                BlurInputIndex::BlurPass as u64,
+                mem::size_of::<BlurPass>() as u64,
+                &horizontal_pass as *const BlurPass as *const _,
+            );
+            horizontal_encoder.set_fragment_texture(
+                BlurInputIndex::SourceTexture as u64,
+                Some(blur_source_texture),
+            );
+            horizontal_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+            horizontal_encoder.end_encoding();
+
+            let composite_encoder = new_command_encoder_for_texture(
+                command_buffer,
+                target_texture,
+                viewport_size,
+                |color_attachment| {
+                    color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                },
+            );
+            composite_encoder.set_render_pipeline_state(&self.blur_composite_pipeline_state);
+            composite_encoder.set_vertex_buffer(
+                BlurInputIndex::Vertices as u64,
+                Some(&self.unit_vertices),
+                0,
+            );
+            composite_encoder.set_vertex_bytes(
+                BlurInputIndex::BlurPass as u64,
+                mem::size_of::<BlurPass>() as u64,
+                &composite_pass as *const BlurPass as *const _,
+            );
+            composite_encoder.set_vertex_bytes(
+                BlurInputIndex::ViewportSize as u64,
+                mem::size_of_val(&viewport_size) as u64,
+                &viewport_size as *const Size<DevicePixels> as *const _,
+            );
+            composite_encoder.set_fragment_bytes(
+                BlurInputIndex::BlurPass as u64,
+                mem::size_of::<BlurPass>() as u64,
+                &composite_pass as *const BlurPass as *const _,
+            );
+            composite_encoder.set_fragment_texture(
+                BlurInputIndex::SourceTexture as u64,
+                Some(blur_horizontal_texture),
+            );
+            composite_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+            composite_encoder.end_encoding();
+        }
+
         true
     }
 
@@ -1721,6 +1934,14 @@ enum QuadInputIndex {
 }
 
 #[repr(C)]
+enum BlurInputIndex {
+    Vertices = 0,
+    BlurPass = 1,
+    ViewportSize = 2,
+    SourceTexture = 3,
+}
+
+#[repr(C)]
 enum UnderlineInputIndex {
     Vertices = 0,
     Underlines = 1,
@@ -1763,6 +1984,44 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct BlurPass {
+    pub target_bounds: Bounds<ScaledPixels>,
+    pub sample_bounds: Bounds<ScaledPixels>,
+    pub clip_bounds: Bounds<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub tint: Hsla,
+    pub blur_radius: ScaledPixels,
+    pub saturation: f32,
+}
+
+impl BlurPass {
+    fn horizontal(blur_rect: BlurRect, capture_bounds: Bounds<ScaledPixels>) -> Self {
+        Self {
+            target_bounds: capture_bounds,
+            sample_bounds: capture_bounds,
+            clip_bounds: capture_bounds,
+            corner_radii: Corners::default(),
+            tint: Hsla::transparent_black(),
+            blur_radius: blur_rect.blur_radius,
+            saturation: 1.0,
+        }
+    }
+
+    fn composite(blur_rect: BlurRect, capture_bounds: Bounds<ScaledPixels>) -> Self {
+        Self {
+            target_bounds: blur_rect.bounds,
+            sample_bounds: capture_bounds,
+            clip_bounds: blur_rect.content_mask.bounds,
+            corner_radii: blur_rect.corner_radii,
+            tint: blur_rect.tint,
+            blur_radius: blur_rect.blur_radius,
+            saturation: blur_rect.saturation,
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

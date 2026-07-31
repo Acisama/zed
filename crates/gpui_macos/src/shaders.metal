@@ -396,6 +396,119 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
 }
 
+struct BlurVertexOutput {
+  uint blur_id [[flat]];
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BlurFragmentInput {
+  uint blur_id [[flat]];
+  float4 position [[position]];
+};
+
+constexpr sampler blur_sampler(coord::normalized, filter::linear,
+                               address::clamp_to_edge);
+
+float2 blur_position(float2 position, BlurPass blur) {
+  float2 target_origin = float2(blur.target_bounds.origin.x, blur.target_bounds.origin.y);
+  float2 target_size = max(
+      float2(blur.target_bounds.size.width, blur.target_bounds.size.height),
+      float2(1.0, 1.0));
+  float2 sample_origin = float2(blur.sample_bounds.origin.x, blur.sample_bounds.origin.y);
+  float2 sample_size = float2(blur.sample_bounds.size.width, blur.sample_bounds.size.height);
+  return sample_origin + ((position - target_origin) / target_size) * sample_size;
+}
+
+float4 blur_along_axis(texture2d<float, access::sample> source_texture,
+                       float2 position, BlurPass blur, float2 axis) {
+  float2 sample_position = blur_position(position, blur);
+  float sigma = max(blur.blur_radius, 0.001);
+  int radius = min(int(ceil(blur.blur_radius * 3.0)), 16);
+  float2 texture_size = float2(source_texture.get_width(), source_texture.get_height());
+  float2 sample_min = float2(blur.sample_bounds.origin.x, blur.sample_bounds.origin.y);
+  float2 sample_max = sample_min +
+      max(float2(blur.sample_bounds.size.width, blur.sample_bounds.size.height) - 1.0,
+          float2(0.0, 0.0));
+
+  float4 accum = float4(0.0);
+  float weight_sum = 0.0;
+  for (int offset = -16; offset <= 16; ++offset) {
+    if (abs(offset) > radius) {
+      continue;
+    }
+
+    float weight = gaussian(float(offset), sigma);
+    float2 clamped = clamp(sample_position + axis * float(offset), sample_min, sample_max);
+    accum += source_texture.sample(blur_sampler, clamped / texture_size) * weight;
+    weight_sum += weight;
+  }
+
+  if (weight_sum == 0.0) {
+    return float4(0.0);
+  }
+
+  return accum / weight_sum;
+}
+
+float4 composite_blur(float4 blurred, BlurPass blur) {
+  float3 grayscale = float3(dot(blurred.rgb, float3(0.2126, 0.7152, 0.0722)));
+  float4 tint = hsla_to_rgba(blur.tint);
+  float3 saturated = mix(grayscale, blurred.rgb, blur.saturation);
+  float alpha = tint.a + blurred.a * (1.0 - tint.a);
+  if (alpha <= 0.0) {
+    return float4(0.0);
+  }
+
+  float3 color =
+      (tint.rgb * tint.a + saturated * blurred.a * (1.0 - tint.a)) / alpha;
+  return float4(color, alpha);
+}
+
+vertex BlurVertexOutput blur_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(BlurInputIndex_Vertices)]],
+    constant BlurPass *blurs [[buffer(BlurInputIndex_BlurPass)]],
+    constant Size_DevicePixels *viewport_size [[buffer(BlurInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  BlurPass blur = blurs[0];
+  float4 position = to_device_position(unit_vertex, blur.target_bounds, viewport_size);
+  float4 clip_distance =
+      distance_from_clip_rect(unit_vertex, blur.target_bounds, blur.clip_bounds);
+  return BlurVertexOutput{0, position,
+                          {clip_distance.x, clip_distance.y, clip_distance.z,
+                           clip_distance.w}};
+}
+
+fragment float4 blur_horizontal_fragment(
+    BlurFragmentInput input [[stage_in]],
+    constant BlurPass *blurs [[buffer(BlurInputIndex_BlurPass)]],
+    texture2d<float, access::sample> source_texture
+    [[texture(BlurInputIndex_SourceTexture)]]) {
+  return blur_along_axis(source_texture, input.position.xy, blurs[0], float2(1.0, 0.0));
+}
+
+fragment float4 blur_composite_fragment(
+    BlurFragmentInput input [[stage_in]],
+    constant BlurPass *blurs [[buffer(BlurInputIndex_BlurPass)]],
+    texture2d<float, access::sample> source_texture
+    [[texture(BlurInputIndex_SourceTexture)]]) {
+  BlurPass blur = blurs[0];
+  float4 color = composite_blur(
+      blur_along_axis(source_texture, input.position.xy, blur, float2(0.0, 1.0)), blur);
+
+  bool unrounded = blur.corner_radii.top_left == 0.0 &&
+      blur.corner_radii.bottom_left == 0.0 &&
+      blur.corner_radii.top_right == 0.0 &&
+      blur.corner_radii.bottom_right == 0.0;
+  if (unrounded) {
+    return color;
+  }
+
+  float distance = quad_sdf(input.position.xy, blur.target_bounds, blur.corner_radii);
+  return color * float4(1.0, 1.0, 1.0, saturate(0.5 - distance));
+}
+
 // Returns the dash velocity of a corner given the dash velocity of the two
 // sides, by returning the slower velocity (larger dashes).
 //
