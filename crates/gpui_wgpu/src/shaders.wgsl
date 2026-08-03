@@ -992,20 +992,23 @@ fn vs_blur(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
 // `sample_bounds` (vs. the tighter `target_bounds` of the composite pass) only exists
 // to give the gaussian kernel real captured pixels to read near the edges of the
 // element being blurred, not to rescale what's sampled.
+const BLUR_MAX_TAPS: i32 = 64;
+
 fn blur_along_axis(source_texture_size: vec2<f32>, position: vec2<f32>, blur: BlurPass, axis: vec2<f32>) -> vec4<f32> {
     let sigma = max(blur.blur_radius, 0.001);
     let radius = ceil(sigma * 3.0);
-    // Only 33 taps are ever sampled per axis. For small radii they land on every
-    // pixel; beyond a radius of 16, taps are spaced `step` pixels apart instead of
-    // adding more of them, trading precision (some banding at very large radii) for
-    // a fixed cost, while still reaching all the way to the edge of the kernel.
-    let step = max(radius / 16.0, 1.0);
+    // At most `2 * BLUR_MAX_TAPS + 1` taps are ever sampled per axis. For small radii
+    // they land on every pixel; beyond a radius of BLUR_MAX_TAPS, taps are spaced
+    // `step` pixels apart instead of adding more of them, trading precision (some
+    // banding at very large radii) for a fixed cost, while still reaching all the way
+    // to the edge of the kernel.
+    let step = max(radius / f32(BLUR_MAX_TAPS), 1.0);
     let sample_min = blur.sample_bounds.origin;
     let sample_max = sample_min + max(blur.sample_bounds.size - vec2<f32>(1.0), vec2<f32>(0.0));
 
     var accum = vec4<f32>(0.0);
     var weight_sum = 0.0;
-    for (var tap = -16; tap <= 16; tap += 1) {
+    for (var tap = -BLUR_MAX_TAPS; tap <= BLUR_MAX_TAPS; tap += 1) {
         let offset = f32(tap) * step;
         let weight = gaussian(offset, sigma);
         let clamped = clamp(position + axis * offset, sample_min, sample_max);

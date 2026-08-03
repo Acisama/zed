@@ -902,23 +902,26 @@ BlurVertexOutput blur_composite_vertex(uint vertex_id: SV_VertexID, uint blur_id
 // `sample_bounds` (vs. the tighter `target_bounds` of the composite pass) only exists
 // to give the gaussian kernel real captured pixels to read near the edges of the
 // element being blurred, not to rescale what's sampled.
+static const int BLUR_MAX_TAPS = 64;
+
 float4 blur_along_axis(float2 position, BlurPass blur, float2 axis) {
     float2 texture_size;
     t_sprite.GetDimensions(texture_size.x, texture_size.y);
 
     float sigma = max(blur.blur_radius, 0.001);
     float radius = ceil(sigma * 3.0);
-    // Only 33 taps are ever sampled per axis. For small radii they land on every
-    // pixel; beyond a radius of 16, taps are spaced `step` pixels apart instead of
-    // adding more of them, trading precision (some banding at very large radii) for
-    // a fixed cost, while still reaching all the way to the edge of the kernel.
-    float step = max(radius / 16.0, 1.0);
+    // At most `2 * BLUR_MAX_TAPS + 1` taps are ever sampled per axis. For small radii
+    // they land on every pixel; beyond a radius of BLUR_MAX_TAPS, taps are spaced
+    // `step` pixels apart instead of adding more of them, trading precision (some
+    // banding at very large radii) for a fixed cost, while still reaching all the way
+    // to the edge of the kernel.
+    float step = max(radius / float(BLUR_MAX_TAPS), 1.0);
     float2 sample_min = blur.sample_bounds.origin;
     float2 sample_max = sample_min + max(blur.sample_bounds.size - 1.0, float2(0.0, 0.0));
 
     float4 accum = float4(0.0, 0.0, 0.0, 0.0);
     float weight_sum = 0.0;
-    for (int tap = -16; tap <= 16; ++tap) {
+    for (int tap = -BLUR_MAX_TAPS; tap <= BLUR_MAX_TAPS; ++tap) {
         float offset = float(tap) * step;
         float weight = gaussian(offset, sigma);
         float2 clamped = clamp(position + axis * offset, sample_min, sample_max);
